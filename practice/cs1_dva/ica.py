@@ -1,112 +1,137 @@
-from differential_functions import apply_smoothing, compute_dqdv, plot_cycles_overlay
+# ica_analysis.py
+from differential_functions import (apply_smoothing, compute_dqdv,
+                                     plot_cycles_overlay, find_features,
+                                     track_features)
 import pandas as pd
+import os
 
 # =============================================================================
 # CONFIGURATION — edit here only
 # =============================================================================
-csv_path = "your_ica_data.csv"  # per-point V-Q discharge curves for selected cycles
-
-# Column positions (0-indexed)
-# Expected order: cycle number, discharge capacity, voltage
-# =============================================================================
-
-df = pd.read_csv(csv_path)
-
-cycle_col    = df.columns[0]
-capacity_col = df.columns[1]
-voltage_col  = df.columns[2]
-
-print("Columns detected:", df.columns.tolist())
-print("Cycles present:  ", [int(c) for c in sorted(df[cycle_col].unique())])
+ICA_CSV_PATH      = "your_ica_data.csv"
+RESUME_CSV        = None
+DV_THRESHOLD      = 0.001       # V — guards against dV→0 blow-up at plateaus
+MAX_FEATURE_SHIFT = 0.05        # V
+ICA_YLIM          = None
 
 # =============================================================================
-# ICA-SPECIFIC PARAMETERS
-# Threshold decisions owned here, not inside differential_functions.py
+
+def run_ica(csv_path=ICA_CSV_PATH,
+            resume_csv=RESUME_CSV,
+            dv_threshold=DV_THRESHOLD,
+            max_feature_shift=MAX_FEATURE_SHIFT,
+            ica_ylim=ICA_YLIM,
+            reference_cycle=None,
+            interactive=True):
+    """
+    Full ICA pipeline. Returns (df, feature_df, tracked_df, features,
+    cycle_col, capacity_col, voltage_col, csv_out).
+    """
+    if resume_csv is not None:
+        if not os.path.exists(resume_csv):
+            raise FileNotFoundError(f"RESUME_CSV not found: {resume_csv}")
+        df = pd.read_csv(resume_csv)
+        print(f"Loaded previously processed ICA dataframe: {resume_csv}")
+        cycle_col    = df.columns[0]
+        capacity_col = df.columns[1]
+        voltage_col  = df.columns[2]
+        for col in ["Voltage_smooth", "dQdV_raw", "dQdV_smooth"]:
+            if col not in df.columns:
+                raise ValueError(
+                    f"Expected column '{col}' not found in {resume_csv}.")
+        print("  Smoothed columns confirmed — skipping to feature detection.")
+        csv_out = resume_csv
+    else:
+        df = pd.read_csv(csv_path)
+        cycle_col    = df.columns[0]
+        capacity_col = df.columns[1]
+        voltage_col  = df.columns[2]
+        print("ICA — Columns detected:", df.columns.tolist())
+        print("ICA — Cycles present:  ",
+              [int(c) for c in sorted(df[cycle_col].unique())])
+
+        # Step 1 — voltage smoothing
+        df, _ = apply_smoothing(
+            df, voltage_col, cycle_col, out_col="Voltage_smooth",
+            x_col=capacity_col, prompt_edge_trim=True
+        )
+
+        # Step 2 — compute raw dQ/dV
+        if interactive:
+            print(f"\n{'='*60}")
+            print(f"dQ/dV computation — dV threshold: {dv_threshold} V")
+            print(f"  Guards against dV→0 blow-up at voltage plateaus.")
+            if input("Edit dV threshold? (yes/no): ").strip().lower() == "yes":
+                raw = input("  New threshold in V (or 'none'): ").strip().lower()
+                dv_threshold = None if raw == "none" else float(raw)
+
+        df = compute_dqdv(
+            df, voltage_col, capacity_col, cycle_col,
+            out_col="dQdV_raw", dv_threshold=dv_threshold
+        )
+
+        # Step 3 — dQ/dV smoothing
+        df, _ = apply_smoothing(
+            df, "dQdV_raw", cycle_col, out_col="dQdV_smooth",
+            x_col=voltage_col, prompt_edge_trim=False
+        )
+
+        # Output naming
+        if interactive:
+            print(f"\n{'='*60}")
+            csv_out  = input("  ICA processed CSV filename: ").strip()
+            plot_out = input("  ICA overlay plot filename:  ").strip()
+            if not csv_out.endswith(".csv"):  csv_out  += ".csv"
+            if not plot_out.endswith(".png"): plot_out += ".png"
+        else:
+            base     = os.path.splitext(os.path.basename(csv_path))[0]
+            csv_out  = f"{base}_ica_processed.csv"
+            plot_out = f"{base}_ica_overlay.png"
+
+        df.to_csv(csv_out, index=False)
+        print(f"  Saved ICA dataframe: {csv_out}")
+
+        plot_cycles_overlay(
+            df, cycle_col,
+            x_col=voltage_col,
+            y_col="dQdV_smooth",
+            xlabel=voltage_col,
+            ylabel="dQ/dV (mAh/V)",
+            title="ICA — dQ/dV vs. Voltage by Cycle",
+            save_path=plot_out,
+            ylim=ica_ylim
+        )
+        print(f"  Saved ICA plot: {plot_out}")
+
+    # Feature detection
+    feature_df = find_features(
+        df, cycle_col,
+        x_col=voltage_col,
+        y_col="dQdV_smooth",
+        mode="peak",
+        reference_cycle=reference_cycle
+    )
+
+    feature_out = csv_out.replace(".csv", "_features.csv")
+    feature_df.to_csv(feature_out, index=False)
+    print(f"  Saved ICA feature summary: {feature_out}")
+
+    features, tracked_df = track_features(
+        feature_df, cycle_col,
+        mode="peak",
+        max_shift=max_feature_shift
+    )
+
+    tracked_out = csv_out.replace(".csv", "_tracked.csv")
+    tracked_df.to_csv(tracked_out, index=False)
+    print(f"  Saved ICA tracked features: {tracked_out}")
+
+    return df, feature_df, tracked_df, features, \
+           cycle_col, capacity_col, voltage_col, csv_out
+
+
 # =============================================================================
-
-# dv_threshold: minimum |dV| step to compute dQ/dV
-# At voltage plateaus dV approaches zero and without the threshold you get ±infinity spikes right at the ICA peaks
-DV_THRESHOLD = None
-
+# STANDALONE ENTRY POINT
 # =============================================================================
-# PIPELINE
-# =============================================================================
-
-# Step 1 — interactive voltage smoothing
-# edge trimming applied here before fitting to exclude end-dropout artifacts
-df, edge_trim_pct = apply_smoothing(
-    df, voltage_col, cycle_col, out_col="Voltage_smooth",
-    prompt_edge_trim=True
-)
-
-# Step 2 — compute raw dQ/dV for ICA
-# Prompt user to confirm or adjust dv_threshold before differentiating
-# dv_threshold actively matters here — at voltage plateaus dV approaches zero
-# and without the threshold you get ±infinity spikes right at the ICA peaks
-print(f"\n{'='*60}")
-print(f"dQ/dV computation — threshold settings")
-print(f"Current dV threshold: {DV_THRESHOLD} V")
-print(f"  Points where |dV| < threshold are set to NaN to suppress plateau spikes.")
-if input("Edit dV threshold? (yes/no): ").strip().lower() == "yes":
-    try:
-        DV_THRESHOLD = float(input(f"  New dV threshold (current {DV_THRESHOLD}): "))
-    except ValueError:
-        print("  Invalid — keeping current threshold.")
-
-# Peaks in dQ/dV vs. voltage mark redox reactions:
-#   LLI  → lateral shift of peak positions along voltage axis
-#   LAM  → reduction in peak height or area
-# Edge-trimmed NaNs in Voltage_smooth propagate naturally into dQdV_raw
-df = compute_dqdv(
-    df, capacity_col, "Voltage_smooth", cycle_col,
-    out_col="dQdV_raw",
-    dv_threshold=DV_THRESHOLD
-)
-
-# Step 3 — interactive dQ/dV smoothing
-# edge trim not re-prompted — already applied in Step 1
-df, _ = apply_smoothing(
-    df, "dQdV_raw", cycle_col, out_col="dQdV_smooth",
-    prompt_edge_trim=False
-)
-
-print("\nFinal dataframe columns:", df.columns.tolist())
-
-# =============================================================================
-# OUTPUT — user-named CSV and ICA overlay plot
-# =============================================================================
-# Name files first, then the plot displays — closing it triggers the save.
-
-print(f"\n{'='*60}")
-print("Output file naming")
-csv_out  = input("  Enter filename for processed dataframe CSV (e.g. ica_processed.csv): ").strip()
-plot_out = input("  Enter filename for ICA overlay plot (e.g. ica_overlay.png): ").strip()
-
-if not csv_out.endswith(".csv"):
-    csv_out += ".csv"
-if not plot_out.endswith(".png"):
-    plot_out += ".png"
-
-df.to_csv(csv_out, index=False)
-print(f"  Saved dataframe: {csv_out}")
-
-# =============================================================================
-# ICA OVERLAY PLOT
-# =============================================================================
-# Displays first (plt.show blocks until window is closed), then saves.
-# ICA plots dQ/dV vs. voltage — x-axis is voltage, not capacity.
-# ylim: None lets matplotlib autoscale since dQ/dV peaks are the signal of
-# interest and we don't want to clip them. Adjust if needed.
-ICA_YLIM = None
-
-plot_cycles_overlay(
-    df, cycle_col,
-    x_col=voltage_col,
-    y_col="dQdV_smooth",
-    xlabel=voltage_col,
-    ylabel="dQ/dV (mAh/V)",
-    title="ICA — dQ/dV vs. Voltage by Cycle",
-    save_path=plot_out,
-    ylim=ICA_YLIM
-)
-print(f"  Saved plot:      {plot_out}")
+if __name__ == "__main__":
+    run_ica()

@@ -1,9 +1,8 @@
 import pandas as pd
 import numpy as np
-from scipy.signal import savgol_filter
+from scipy.signal import find_peaks, peak_prominences, savgol_filter
 from scipy.interpolate import UnivariateSpline
 import matplotlib.pyplot as plt
-import math
 
 # =============================================================================
 # DEFAULT SMOOTHING PARAMETERS
@@ -183,6 +182,125 @@ def compute_dqdv(df, capacity_col, smoothed_voltage_col, cycle_col,
 
 
 # =============================================================================
+# UNIFORM GRID RESAMPLING
+# Used by both DVA (x=capacity) and ICA (x=voltage) before differentiation.
+# Eliminates dV/dQ or dQ/dV blow-up caused by near-zero steps in the x-axis.
+# =============================================================================
+
+def resample_to_uniform_grid(df, x_col, y_col, cycle_col, step,
+                              x_min=None, x_max=None):
+    """
+    Resample each cycle onto a uniform x-axis grid by interpolating y onto
+    evenly spaced x points. Returns a new dataframe — original is unchanged.
+
+    This is the correct fix for dQ/dV or dV/dQ noise caused by a non-uniform
+    x-axis: once x steps are fixed, the denominator in the derivative is
+    constant and cannot blow up at plateaus or turnaround regions.
+
+    DVA : x_col=capacity_col, y_col=voltage_col, step in mAh (e.g. 0.5)
+    ICA : x_col=voltage_col,  y_col=capacity_col, step in V   (e.g. 0.001)
+
+    Parameters
+    ----------
+    df        : dataframe with cycle_col, x_col, y_col
+    x_col     : column to use as the uniform grid axis
+    y_col     : column to interpolate onto the grid
+    cycle_col : column identifying cycle number
+    step      : grid spacing in x_col units
+    x_min     : optional global lower bound for grid. None = per-cycle min.
+    x_max     : optional global upper bound for grid. None = per-cycle max.
+                Providing global bounds keeps all cycles on the same grid,
+                which is required for cross-cycle feature position comparisons.
+
+    Returns
+    -------
+    resampled_df : new dataframe with columns [cycle_col, x_col, y_col],
+                   one row per grid point per cycle. Any additional columns
+                   from the original df are dropped — resample only the
+                   columns needed for the derivative step.
+
+    Notes
+    -----
+    - Interpolation is linear (np.interp). Sufficient for electrochemical
+      curves sampled at reasonable resolution; no extrapolation beyond the
+      cycle's own x range.
+    - Points outside a cycle's x range are set to NaN so grid shape is
+      preserved when global x_min/x_max are used.
+    - step should be >= the median x spacing of the raw data to avoid
+      artificial interpolation artefacts. Check with:
+          df.groupby(cycle_col)[x_col].apply(lambda g: np.median(np.diff(g.values)))
+    """
+    records = []
+    cycles  = sorted(df[cycle_col].unique())
+
+    # compute global grid bounds once if requested
+    g_min = x_min if x_min is not None else None
+    g_max = x_max if x_max is not None else None
+
+    for cyc in cycles:
+        sub   = df[df[cycle_col] == cyc].dropna(subset=[x_col, y_col])
+        x_raw = sub[x_col].values.astype(float)
+        y_raw = sub[y_col].values.astype(float)
+
+        # sort by x to guarantee np.interp monotonicity requirement
+        order = np.argsort(x_raw)
+        x_raw = x_raw[order]
+        y_raw = y_raw[order]
+
+        lo = g_min if g_min is not None else x_raw.min()
+        hi = g_max if g_max is not None else x_raw.max()
+
+        x_grid = np.arange(lo, hi + step * 0.5, step)  # +0.5*step avoids float edge exclusion
+
+        # interpolate; points outside cycle's own range become NaN
+        y_grid = np.interp(x_grid, x_raw, y_raw,
+                           left=np.nan, right=np.nan)
+
+        for xi, yi in zip(x_grid, y_grid):
+            records.append({cycle_col: cyc, x_col: xi, y_col: yi})
+
+    resampled_df = pd.DataFrame(records)
+    return resampled_df
+
+
+def check_grid_uniformity(df, x_col, cycle_col, sample_cycles=5):
+    """
+    Print a quick diagnostic of x-axis spacing to help decide whether
+    resampling is needed and what step size to use.
+
+    Reports median, min, max, and std of diff(x_col) for a sample of cycles.
+    A large std relative to the median indicates a non-uniform grid that will
+    cause derivative blow-up and should be resampled before differentiation.
+
+    Parameters
+    ----------
+    df            : dataframe with cycle_col and x_col
+    x_col         : column to check spacing on
+    cycle_col     : column identifying cycle number
+    sample_cycles : how many cycles to report (evenly spaced across all cycles)
+    """
+    cycles  = sorted(df[cycle_col].unique())
+    indices = np.linspace(0, len(cycles) - 1, min(sample_cycles, len(cycles)), dtype=int)
+    sample  = [cycles[i] for i in indices]
+
+    print(f"\nGrid uniformity check — '{x_col}'")
+    print(f"  {'cycle':>8}  {'n_pts':>6}  {'median_step':>12}  {'min_step':>10}  "
+          f"{'max_step':>10}  {'std_step':>10}  {'uniform?':>9}")
+
+    for cyc in sample:
+        sub  = df[df[cycle_col] == cyc].dropna(subset=[x_col])
+        vals = sub[x_col].values.astype(float)
+        d    = np.diff(np.sort(vals))
+        med  = np.median(d)
+        uniform = "yes" if (np.std(d) / med < 0.05) else "NO"
+        print(f"  {int(cyc):>8}  {len(vals):>6}  {med:>12.5f}  {d.min():>10.5f}  "
+              f"{d.max():>10.5f}  {np.std(d):>10.5f}  {uniform:>9}")
+
+    print(f"\n  Suggested step: median of medians = "
+          f"{np.median([np.median(np.diff(np.sort(df[df[cycle_col]==c][x_col].dropna().values.astype(float)))) for c in sample]):.5f}")
+
+
+# =============================================================================
 # INTERACTIVE INSPECT LOOP (generic — works for any column pair)
 # =============================================================================
 
@@ -236,6 +354,7 @@ def _inspect_cycle(df, cycle_col, x_col, raw_col, smooth_col,
 # =============================================================================
 
 def apply_smoothing(df, target_col, cycle_col, out_col,
+                    x_col=None,
                     window=SAVGOL_WINDOW, polyorder=SAVGOL_POLYORDER,
                     spline_s=SPLINE_SMOOTHING,
                     edge_trim_pct=EDGE_TRIM_PCT,
@@ -246,6 +365,9 @@ def apply_smoothing(df, target_col, cycle_col, out_col,
     Threshold decisions (dv_threshold, dq_threshold) are handled by the calling
     analysis script (dva_analysis.py, ica_analysis.py), not here.
 
+    - x_col: column to use as the x-axis in inspection plots. Pass the capacity
+      column for DVA voltage smoothing, or the voltage column for ICA dQ/dV
+      smoothing. Defaults to df.columns[1] for backwards compatibility.
     - Prompts user to choose method and confirm/edit smoothing parameters.
     - Edge trimming applied before fitting to exclude end-dropout artifacts.
     - prompt_edge_trim=False suppresses edge trim prompt (use for derivative
@@ -256,7 +378,7 @@ def apply_smoothing(df, target_col, cycle_col, out_col,
     Returns (df, edge_trim_pct).
     """
     cycles      = sorted(df[cycle_col].unique())
-    x_col       = df.columns[1]
+    x_col       = x_col if x_col is not None else df.columns[1]
     first_cycle = cycles[0]
 
     print(f"\n{'='*60}")
@@ -303,10 +425,9 @@ def apply_smoothing(df, target_col, cycle_col, out_col,
         if prompt_edge_trim:
             print(f"\nCurrent edge trim: {edge_trim_pct*100:.1f}% of points from each end")
             print("  Excludes noisy voltage-cutoff turnaround from spline/SG fit entirely.")
-            print("  Recommended: 1.5% based on dataset spec.")
             if input("Edit edge trim? (yes/no): ").strip().lower() == "yes":
                 try:
-                    pct = float(input(f"  New trim % (e.g. 1.5, current {edge_trim_pct*100:.1f}%): "))
+                    pct = float(input(f"  New trim % (e.g. 1.0, current {edge_trim_pct*100:.1f}%): "))
                     edge_trim_pct = pct / 100.0
                 except ValueError:
                     print("  Invalid — keeping current trim.")
@@ -549,13 +670,11 @@ def compute_lean(df, voltage_col, cycle_col, out_col,
         bin_idx   = np.digitize(v, edges) - 1
         bin_idx   = np.clip(bin_idx, 0, len(centres) - 1)
         n_bins    = len(centres)
-        dqdv_bins = np.full(n_bins, np.nan)
 
-        for b in range(n_bins):
-            mask = bin_idx == b
-            if mask.sum() > 0:
-                # total charge in bin / bin width = dQ/dV for this bin
-                dqdv_bins[b] = dq_per_sample[mask].sum() / bin_width
+        # vectorised: sum charge per bin and mark empty bins as NaN
+        bin_sums   = np.bincount(bin_idx, weights=dq_per_sample, minlength=n_bins).astype(float)
+        bin_counts = np.bincount(bin_idx, minlength=n_bins)
+        dqdv_bins  = np.where(bin_counts > 0, bin_sums / bin_width, np.nan)
 
         # map bin dQ/dV back to each original sample point for dataframe alignment
         result = dqdv_bins[bin_idx]
@@ -576,19 +695,25 @@ def find_features(df, cycle_col, x_col, y_col,
     """
     Interactively identify peaks or troughs in a differential curve and compute
     per-feature properties (position, extremum, depth/height, area) relative to
-    a local linear baseline fitted between the shoulders on either side of each
-    feature.
+    a fixed horizontal baseline fitted from the reference cycle.
 
     Generic — covers all three analysis types:
       DVA  : mode="trough", y_col="dVdQ_smooth", x_col=capacity_col
       ICA  : mode="peak",   y_col="dQdV_smooth", x_col=voltage_col
       LEAN : mode="peak",   y_col="dQdV_lean",   x_col=voltage_col
 
+    Baseline
+    --------
+    A single fixed baseline level is computed once from the reference cycle
+    (global max for troughs, global min for peaks, clipped to 0 if the curve
+    crosses zero). This fixed value is reused for all cycles, giving area an
+    absolute meaning across cycles — essential for LAM quantification.
+
     Workflow
     --------
     1. Display prominence histogram for a reference cycle.
     2. Prompt user to set prominence threshold.
-    3. Display detected features overlaid on the curve with local baselines
+    3. Display detected features overlaid on the curve with baselines
        and shaded areas — loop until threshold is confirmed.
     4. Apply confirmed threshold to all cycles and return a summary dataframe.
 
@@ -608,7 +733,6 @@ def find_features(df, cycle_col, x_col, y_col,
                  cycle_col, feature_idx, x_position, y_extremum,
                  baseline_at_extremum, depth_or_height, area
     """
-    from scipy.signal import find_peaks, peak_prominences
 
     plt.close("all")   # clear any figures left open from previous pipeline steps
 
@@ -623,16 +747,14 @@ def find_features(df, cycle_col, x_col, y_col,
     if reference_cycle is None:
         reference_cycle = cycles[0]
 
-    def _find_shoulders(y, peak_idx, search_radius=None, exclusion_zone=5):
+    def _find_shoulders(y, peak_idx, exclusion_zone=5):
         """
         Find the nearest inflection points (zero crossings of dy) on either
         side of a trough/peak as shoulder points for local baseline fitting.
 
         Clips extreme dy values (>99th percentile absolute) before finding sign
-        changes — this suppresses end-of-discharge spike artifacts that would
-        otherwise create spurious critical points far from the feature, without
-        needing a search_radius that might accidentally exclude legitimate nearby
-        shoulders.
+        changes — suppresses end-of-discharge spike artifacts that would
+        otherwise create spurious critical points far from the feature.
 
         exclusion_zone: points around peak_idx to ignore — prevents the
         extremum's own sign change from being picked up as a shoulder.
@@ -651,43 +773,20 @@ def find_features(df, cycle_col, x_col, y_col,
         left_candidates  = sign_changes[sign_changes < peak_idx]
         right_candidates = sign_changes[sign_changes > peak_idx]
 
-        if search_radius is not None:
-            left_candidates  = left_candidates[left_candidates  >= peak_idx - search_radius]
-            right_candidates = right_candidates[right_candidates <= peak_idx + search_radius]
-
         lb = int(left_candidates[-1])  if len(left_candidates)  > 0 else 0
         rb = int(right_candidates[0])  if len(right_candidates) > 0 else n - 1
         return lb, rb
 
 
 
-    def _fit_local_baseline(x, y, lb, rb, mode, fixed_baseline=None):
-        """
-        Horizontal baseline for area integration.
-
-        If fixed_baseline is provided (computed from cycle 10), uses that
-        fixed value for all cycles — recommended for LAM quantification
-        since it gives area a consistent absolute meaning across cycles.
-
-        Otherwise computes per-cycle from global max (trough) or min (peak),
-        clipped to 0 if the curve crosses zero — used for the interactive
-        visualisation loop where per-cycle display is appropriate.
-        """
-        if fixed_baseline is not None:
-            return np.full(len(x), fixed_baseline)
-
-        if mode == "trough":
-            baseline_level = float(np.max(y))
-            if baseline_level > 0:
-                baseline_level = 0.0
-        else:
-            baseline_level = float(np.min(y))
-            if baseline_level < 0:
-                baseline_level = 0.0
-
-        return np.full(len(x), baseline_level)
-
     def _compute_fixed_baseline(cyc):
+        """
+        Compute a single fixed baseline level from the reference cycle.
+        Trough mode: global max of the curve, clipped to 0 if positive.
+        Peak  mode: global min of the curve, clipped to 0 if negative.
+        This value is reused for all cycles so that area has a consistent
+        absolute meaning across cycles — required for LAM quantification.
+        """
         sub = df[df[cycle_col] == cyc].dropna(subset=[y_col])
         y_base = sub[y_col].values.astype(float)
 
@@ -720,12 +819,13 @@ def find_features(df, cycle_col, x_col, y_col,
         ax = axes[0]
         ax.plot(x_c, y_c, color="tab:blue", linewidth=1, label=y_col)
         for i, pk in enumerate(pks):
-            lb, rb   = _find_shoulders(y_c, pk, search_radius=None)
-            baseline = _fit_local_baseline(x_c, y_c, lb, rb, mode,
-                                           fixed_baseline=fixed_baseline)
-            ax.fill_between(x_c[lb:rb+1], y_c[lb:rb+1], baseline[lb:rb+1],
+            baseline_arr = np.full(len(x_c), fixed_baseline)
+            ax.fill_between(x_c, y_c, baseline_arr,
+                            where=((np.arange(len(x_c)) >= _find_shoulders(y_c, pk)[0]) &
+                                   (np.arange(len(x_c)) <= _find_shoulders(y_c, pk)[1])),
                             alpha=0.25, color="tab:orange")
-            ax.plot(x_c[lb:rb+1], baseline[lb:rb+1],
+            lb, rb = _find_shoulders(y_c, pk)
+            ax.plot(x_c[lb:rb+1], baseline_arr[lb:rb+1],
                     color="tab:orange", linewidth=1, linestyle="--")
             ax.scatter(x_c[pk], y_c[pk], color="red", s=50, zorder=5,
                        label=f"{label} extremum" if i == 0 else "")
@@ -861,14 +961,14 @@ def find_features(df, cycle_col, x_col, y_col,
         if len(pks) == 0:
             continue
 
+        baseline_arr = np.full(len(x_c), fixed_baseline)
+
         for i, pk in enumerate(pks):
-            lb, rb          = _find_shoulders(y_c, pk, search_radius=None)
-            baseline        = _fit_local_baseline(x_c, y_c, lb, rb, mode,
-                                                  fixed_baseline=fixed_baseline)
-            baseline_at_ext = baseline[pk]
+            lb, rb          = _find_shoulders(y_c, pk)
+            baseline_at_ext = fixed_baseline
             depth_or_height = abs(y_c[pk] - baseline_at_ext)
             area            = np.abs(np.trapezoid(
-                                y_c[lb:rb+1] - baseline[lb:rb+1],
+                                y_c[lb:rb+1] - baseline_arr[lb:rb+1],
                                 x_c[lb:rb+1]
                               ))
 
@@ -893,33 +993,32 @@ def find_features(df, cycle_col, x_col, y_col,
 
 def debug_critical_points(df, cycle_col, x_col, y_col, mode,
                            cycle=None, prominence_threshold=0,
-                           search_radius=400, exclusion_zone=5):
+                           exclusion_zone=5):
     """
     Debug helper to visualise critical points (dy = 0 sign changes) on a
     single cycle's differential curve alongside detected features.
 
-    Plots three panels:
+    Plots two panels:
       Left   — the raw y curve with all critical points marked (grey dots),
                 the detected feature extrema (red dots), and the shoulder
                 pairs selected for each feature (orange vertical lines).
-      Middle — the first derivative dy with zero line, showing where sign
+      Right  — the first derivative dy with zero line, showing where sign
                changes occur.
-      Right  — zoomed table printout in terminal of every critical point
-               index, x position, and which feature (if any) it was
-               assigned to as left/right shoulder.
+
+    A table of every critical point index, x position, and shoulder assignment
+    is printed to the terminal.
 
     Parameters
     ----------
-    df                 : dataframe with cycle_col, x_col, y_col
-    cycle_col          : cycle number column
-    x_col              : x-axis column
-    y_col              : smoothed differential column
-    mode               : "trough" or "peak"
-    cycle              : which cycle to debug. None = first cycle.
+    df                  : dataframe with cycle_col, x_col, y_col
+    cycle_col           : cycle number column
+    x_col               : x-axis column
+    y_col               : smoothed differential column
+    mode                : "trough" or "peak"
+    cycle               : which cycle to debug. None = first cycle.
     prominence_threshold: feature detection threshold (use same value as
                           find_features to see the same features)
-    search_radius      : same value used in find_features (default 400)
-    exclusion_zone     : same value used in find_features (default 5)
+    exclusion_zone      : same value used in find_features (default 5)
     """
 
     sign     = 1 if mode == "peak" else -1
@@ -953,9 +1052,6 @@ def debug_critical_points(df, cycle_col, x_col, y_col, mode,
         sc = sc[np.abs(sc - pk) > exclusion_zone]
         lc = sc[sc < pk]
         rc = sc[sc > pk]
-        if search_radius is not None:
-            lc = lc[lc >= pk - search_radius]
-            rc = rc[rc <= pk + search_radius]
         lb = int(lc[-1]) if len(lc) > 0 else 0
         rb = int(rc[0])  if len(rc) > 0 else len(x) - 1
         shoulder_pairs.append((pk, lb, rb))
@@ -1028,7 +1124,7 @@ def debug_critical_points(df, cycle_col, x_col, y_col, mode,
     ax2.legend(fontsize=7)
 
     fig.suptitle(f"Debug: Critical Points — Cycle {int(cycle)}, mode={mode}, "
-                 f"search_radius={search_radius}, exclusion_zone={exclusion_zone}",
+                 f"exclusion_zone={exclusion_zone}",
                  fontsize=10)
     fig.tight_layout()
     plt.show()
@@ -1059,11 +1155,8 @@ class DifferentialFeature:
     area                 : dict {cycle: value}
     """
 
-    _id_counter = 0
-
-    def __init__(self, mode, seed_cycle, seed_record):
-        DifferentialFeature._id_counter += 1
-        self.feature_id = DifferentialFeature._id_counter
+    def __init__(self, mode, seed_cycle, seed_record, feature_id):
+        self.feature_id = feature_id
         self.mode       = mode
         self.cycles     = [seed_cycle]
         self.x_position          = {seed_cycle: seed_record["x_position"]}
@@ -1129,11 +1222,9 @@ def track_features(feature_df, cycle_col, mode, max_shift=None):
     tracked_df  : long-format dataframe with feature_id column added, suitable
                   for plotting and LLI/LAM calculations
     """
-    # reset class counter so IDs start fresh each call
-    DifferentialFeature._id_counter = 0
-
     cycles   = sorted(feature_df[cycle_col].unique())
     features = []   # list of DifferentialFeature instances
+    next_id  = 1    # local counter — avoids class-level state
 
     for cyc in cycles:
         cyc_rows = feature_df[feature_df[cycle_col] == cyc].to_dict("records")
@@ -1141,7 +1232,8 @@ def track_features(feature_df, cycle_col, mode, max_shift=None):
         if not features:
             # first cycle — seed one instance per detected feature
             for row in cyc_rows:
-                features.append(DifferentialFeature(mode, cyc, row))
+                features.append(DifferentialFeature(mode, cyc, row, next_id))
+                next_id += 1
             continue
 
         # subsequent cycles — match each detected feature to nearest existing instance
@@ -1170,9 +1262,11 @@ def track_features(feature_df, cycle_col, mode, max_shift=None):
                     matched_instance.add(id(best_instance))
                 else:
                     # too far from any existing feature — new instance
-                    features.append(DifferentialFeature(mode, cyc, row))
+                    features.append(DifferentialFeature(mode, cyc, row, next_id))
+                    next_id += 1
             else:
-                features.append(DifferentialFeature(mode, cyc, row))
+                features.append(DifferentialFeature(mode, cyc, row, next_id))
+                next_id += 1
 
     # compile tracked_df
     all_dfs   = [f.to_dataframe() for f in features]
